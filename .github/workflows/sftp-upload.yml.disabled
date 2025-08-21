@@ -1,0 +1,31 @@
+name: SFTP Upload
+
+on:
+  push:
+    branches:
+      - main  # Trigger on push to the main branch
+
+  workflow_dispatch:  # Allows manual triggering of the workflow
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Upload Directory to SFTP
+        run: node auth/upload.js
+        env:
+          SFTP_SERVER: ${{ secrets.SFTP_SERVER }}
+          SFTP_USER: ${{ secrets.SFTP_USER }}
+          SFTP_PRIVATEKEY: ${{ secrets.SFTP_PRIVATEKEY }}

@@ -1,0 +1,37 @@
+{
+  "name": "ds-template",
+  "version": "1.0.0",
+  "description": "Node Template for Data Project Workflows",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "upload": "node auth/upload.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "iguacel",
+  "license": "ISC",
+  "dependencies": {
+    "@octokit/core": "^6.1.2",
+    "axios": "^1.7.5",
+    "change-case": "^5.4.4",
+    "cheerio": "^1.0.0",
+    "csv-parser": "^3.0.0",
+    "d3-dsv": "^3.0.1",
+    "date-fns": "^3.6.0",
+    "dayjs": "^1.11.13",
+    "dotenv": "^16.4.5",
+    "fs": "^0.0.1-security",
+    "fs-extra": "^11.3.1",
+    "googleapis": "^143.0.0",
+    "lodash.groupby": "^4.6.0",
+    "lodash.maxby": "^4.6.0",
+    "lodash.round": "^4.0.4",
+    "node-fetch": "^3.3.2",
+    "readline": "^1.3.0",
+    "shapefile": "^0.6.6",
+    "ssh2-sftp-client": "^11.0.0",
+    "stream": "^0.0.3",
+    "unzipper": "^0.12.3"
+  }
+}

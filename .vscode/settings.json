@@ -1,0 +1,17 @@
+{
+  // Specifies the path to the Python interpreter for this project
+  "python.defaultInterpreterPath": "./sose/bin/python",
+  // Format the code on save
+  "editor.formatOnSave": true,
+  // Enable/disable the use of type checking
+  "python.analysis.typeCheckingMode": "basic",
+  // Specify the Python testing framework
+  "python.testing.unittestEnabled": true,
+  "python.testing.pytestEnabled": false,
+  // Enable/disable showing line numbers
+  "editor.lineNumbers": "on",
+  // Set the tab size for the Python code
+  "editor.tabSize": 4,
+  // Highlight matching brackets
+  "editor.matchBrackets": "always"
+}
