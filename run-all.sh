@@ -24,7 +24,7 @@ echo "-> Ejecutando 06-small.sh"
 ./06-small.sh
 
 echo "-> Ejecutando move-perimeters"
-./move-perimters.sh
+./move-perimeters.sh
 
 echo "-> Ejecutando 07-ourense.sh"
 ./07-ourense.sh
