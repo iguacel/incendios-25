@@ -26,7 +26,13 @@ echo "-> Ejecutando 06-small.sh"
 echo "-> Ejecutando move-perimeters"
 ./move-perimeters.sh
 
-echo "-> Ejecutando 07-ourense.sh"
-./07-ourense.sh
+echo "-> Ejecutando ccaa"
+./11-ccaa.sh
+
+echo "-> Ejecutando provincias"
+./12-provincias.sh
+
+echo "-> Ejecutando EVO"
+./13-evo_ccaa.sh
 
 echo ">>> Pipeline terminado con éxito ✅"
