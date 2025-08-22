@@ -1,0 +1,565 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import argparse
+import math
+import json
+from pathlib import Path
+from datetime import datetime, timezone
+
+import geopandas as gpd
+import pandas as pd
+from shapely.validation import make_valid as _make_valid
+from shapely.geometry import Polygon, MultiPolygon, mapping
+import svgwrite
+
+# Para rasterizar SVG -> PNG (añade dependencia: cairosvg)
+import cairosvg
+
+
+# ---------- util geom ----------
+
+def make_valid(geom):
+    try:
+        return _make_valid(geom)
+    except Exception:
+        try:
+            return geom.buffer(0)
+        except Exception:
+            return geom
+
+
+def ensure_crs_4326(gdf):
+    """Si el GeoDataFrame no tiene CRS, asumimos EPSG:4326 (GeoJSON por defecto)."""
+    return gdf.set_crs(4326) if gdf.crs is None else gdf
+
+
+def compute_area_ha(gdf, area_col_hint="area_ha"):
+    """
+    Devuelve serie de área en hectáreas, usando el campo 'area_ha' si existe y es válido.
+    Si faltan algunos valores, calcula en EPSG:3035 (LAEA Europe).
+    """
+    gdf = ensure_crs_4326(gdf)
+    if area_col_hint in gdf.columns and gdf[area_col_hint].notna().any():
+        out = gdf[area_col_hint].copy()
+        missing = out.isna()
+        if missing.any():
+            aea = (gdf.loc[missing].to_crs(3035).geometry.area / 10_000.0)
+            out.loc[missing] = aea
+        return out.astype(float)
+    else:
+        return (gdf.to_crs(3035).geometry.area / 10_000.0).astype(float)
+
+
+# ---------- helpers de formato/fechas ----------
+
+MESES_ES = [
+    "enero", "febrero", "marzo", "abril", "mayo", "junio",
+    "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"
+]
+
+def format_es_number(num, dec=0):
+    """
+    Formato español: separador de miles '.' y decimal ','.
+    Para la salida pedida (e.g., 5026 -> '5.026'), usamos dec=0.
+    """
+    if num is None or pd.isna(num):
+        return ""
+    n = round(float(num), dec)
+    if dec == 0:
+        s = f"{int(n):,}"
+        return s.replace(",", ".")
+    else:
+        s = f"{n:,.{dec}f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        return s
+
+def isoformat_z(dt: datetime) -> str:
+    """
+    ISO con milisegundos y sufijo 'Z' en UTC.
+    """
+    if dt is None:
+        return ""
+    dt = dt.astimezone(timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+def firedate_show_es(dt: datetime) -> str:
+    """
+    '08 de agosto' (día con cero inicial + mes en minúsculas).
+    """
+    if dt is None:
+        return ""
+    dt = dt.astimezone(timezone.utc)
+    dia = dt.strftime("%d")
+    mes = MESES_ES[dt.month - 1]
+    return f"{dia} de {mes}"
+
+
+# ---------- svg helpers ----------
+
+def path_from_polygon(poly: Polygon, ox: float, oy: float, scale: float,
+                      bounds: tuple, flip_y=True, precision=2) -> str:
+    minx, miny, maxx, maxy = bounds
+
+    def fmt(x): return f"{x:.{precision}f}"
+
+    def transform(x, y):
+        X = (x - minx) * scale + ox
+        Yraw = (y - miny) * scale + oy
+        return (X, (oy + (maxy - miny) * scale - (Yraw - oy)) if flip_y else Yraw)
+
+    def ring_to_cmds(coords):
+        cmds, first = [], True
+        for (x, y) in coords:
+            X, Y = transform(x, y)
+            cmds.append(("M" if first else "L", X, Y))
+            first = False
+        cmds.append(("Z", None, None))
+        return cmds
+
+    d_parts = []
+    ext = list(poly.exterior.coords)
+    for cmd, X, Y in ring_to_cmds(ext):
+        d_parts.append("Z" if cmd == "Z" else f"{cmd} {fmt(X)} {fmt(Y)}")
+
+    for hole in poly.interiors:
+        for cmd, X, Y in ring_to_cmds(list(hole.coords)):
+            d_parts.append("Z" if cmd == "Z" else f"{cmd} {fmt(X)} {fmt(Y)}")
+
+    return " ".join(d_parts)
+
+
+# ---------- color rules ----------
+
+COLOR_2025 = "#fac4c5"
+COLOR_RECENT = "#a80127"  # firedate >= cutoff
+COLOR_DEFAULT = "#d8d0d0"
+
+def parse_firedate(val):
+    """
+    Devuelve datetime con tz UTC si hay valor ISO; None si no es parseable.
+    """
+    if val is None or val == "":
+        return None
+    try:
+        ts = pd.to_datetime(val, utc=True)
+        if pd.isna(ts):
+            return None
+        return ts.to_pydatetime()
+    except Exception:
+        return None
+
+def safe_int(val, default=None):
+    try:
+        if pd.isna(val):
+            return default
+        return int(str(val).strip())
+    except Exception:
+        return default
+
+def pick_color(row, cutoff_dt_utc):
+    """
+    Prioridad:
+      1) firedate >= 2025-08-08 → COLOR_RECENT  (incluye el día 8)
+      2) fireyear == 2025       → COLOR_2025
+      3) resto                  → COLOR_DEFAULT
+    """
+    fd = parse_firedate(row.get("firedate"))
+    if fd is not None:
+        if fd.tzinfo is None:
+            fd = fd.replace(tzinfo=timezone.utc)
+        if fd >= cutoff_dt_utc:
+            return COLOR_RECENT
+    fy = safe_int(row.get("fireyear"))
+    if fy == 2025:
+        return COLOR_2025
+    return COLOR_DEFAULT
+
+
+# ---------- draw (SVG gigante) ----------
+
+def draw_geoms_to_svg_scaled(gdf, out_path: Path, cols=14, cell=64, margin=24,
+                             stroke="", stroke_width=0,
+                             label=False, font_size=7):
+    """
+    Dibuja geometrías con escala GLOBAL (comparables en área), en rejilla.
+    Colorea cada feature según reglas (firedate / fireyear).
+    Etiqueta: rank, mun, prov, ccaa, fireyear (si label=True).
+    """
+    geoms = list(gdf.geometry)
+    n = len(geoms)
+    if n == 0:
+        raise SystemExit("No hay geometrías para dibujar.")
+    rows = math.ceil(n / cols)
+
+    width = margin * 2 + cols * cell
+    height = margin * 2 + rows * cell
+    dwg = svgwrite.Drawing(str(out_path), size=(width, height), profile="full")
+
+    inner_pad = 4
+    inner = cell - inner_pad * 2
+
+    # Escala global a partir de todas las geometrías
+    max_w = max(g.bounds[2] - g.bounds[0] for g in geoms if not g.is_empty)
+    max_h = max(g.bounds[3] - g.bounds[1] for g in geoms if not g.is_empty)
+    global_scale = min(inner / max_w, inner / max_h)
+
+    # cutoff: 2025-08-08 00:00:00Z
+    cutoff_dt_utc = datetime(2025, 8, 8, 0, 0, 0, tzinfo=timezone.utc)
+
+    for i, geom in enumerate(geoms):
+        if geom.is_empty:
+            continue
+
+        r, c = i // cols, i % cols
+        ox_cell = margin + c * cell + inner_pad
+        oy_cell = margin + r * cell + inner_pad
+        bounds = geom.bounds
+        scale = global_scale
+
+        # path (admite MultiPolygon)
+        if isinstance(geom, Polygon):
+            polys = [geom]
+        elif isinstance(geom, MultiPolygon):
+            polys = list(geom.geoms)
+        else:
+            mapped = mapping(geom)
+            if mapped.get("type") == "Polygon":
+                polys = [geom]
+            elif mapped.get("type") == "MultiPolygon":
+                polys = list(geom.geoms)
+            else:
+                continue
+
+        d_total = []
+        for poly in polys:
+            d_total.append(path_from_polygon(poly, ox_cell, oy_cell, scale, bounds, flip_y=True))
+
+        # color por reglas
+        fill = pick_color(gdf.iloc[i], cutoff_dt_utc)
+
+        path = dwg.path(
+            d=" ".join(d_total),
+            fill=fill,
+            stroke=stroke,
+            stroke_width=stroke_width,
+            fill_rule="evenodd",
+            style="vector-effect:non-scaling-stroke",
+        )
+        dwg.add(path)
+
+        if label:
+            rank = i + 1
+            mun = gdf.iloc[i].get("mun", "—")
+            prov = gdf.iloc[i].get("prov", "—")
+            ccaa = gdf.iloc[i].get("ccaa", "—")
+            fireyear = gdf.iloc[i].get("fireyear", "—")
+            ha = gdf.iloc[i].get("area_ha", "—")
+
+            # 5 líneas muy compactas
+            y0 = oy_cell + 2 + font_size
+            dy = font_size * 1.2
+
+            dwg.add(dwg.text(
+                f"{mun}",
+                insert=(ox_cell + 2, y0),
+                font_size=font_size,
+                font_family="MarcinAntB, sans-serif",
+                fill="#444"
+            ))
+            dwg.add(dwg.text(
+                f"{prov}",
+                insert=(ox_cell + 2, y0 + dy),
+                font_size=font_size,
+                font_family="MarcinAntB, sans-serif",
+                fill="#222"
+            ))
+            dwg.add(dwg.text(
+                f"{ha}",
+                insert=(ox_cell + 2, y0 + dy * 2),
+                font_size=font_size,
+                font_family="MarcinAntB, sans-serif",
+                fill="#222"
+            ))
+            dwg.add(dwg.text(
+                f"{ccaa}",
+                insert=(ox_cell + 2, y0 + dy * 3),
+                font_size=font_size,
+                font_family="MarcinAntB, sans-serif",
+                fill="#000"
+            ))
+            dwg.add(dwg.text(
+                f"{fireyear}",
+                insert=(ox_cell + 2, y0 + dy * 4),
+                font_size=font_size,
+                font_family="MarcinAntB, sans-serif",
+                fill="#000"
+            ))
+
+    dwg.save()
+    return width, height
+
+
+# ---------- mini-render por feature (PNG/SVG 200x200) ----------
+
+def render_feature_tile(row, geom, out_svg: Path, out_png: Path,
+                        global_scale: float, cutoff_dt_utc, stroke="", stroke_width=0.0,
+                        tile_size=200, pad=8, fill_override=None):
+    """
+    Renderiza una feature individual con la MISMA escala global.
+    Si fill_override es str (p.ej. '#fff'), lo usa en vez del color por reglas.
+    """
+    # lienzo cuadrado
+    width = height = tile_size
+    dwg = svgwrite.Drawing(str(out_svg), size=(width, height), profile="full")
+
+    # área interior
+    inner = tile_size - pad * 2
+    # offsets centrados a partir del bbox de la geometría
+    minx, miny, maxx, maxy = geom.bounds
+    geom_w, geom_h = (maxx - minx), (maxy - miny)
+    draw_w, draw_h = geom_w * global_scale, geom_h * global_scale
+    ox = (tile_size - draw_w) / 2.0
+    oy = (tile_size - draw_h) / 2.0
+
+    # construir path
+    def add_poly(poly: Polygon):
+        d = path_from_polygon(poly, ox, oy, global_scale, (minx, miny, maxx, maxy), flip_y=True)
+        fill_color = fill_override if isinstance(fill_override, str) else pick_color(row, cutoff_dt_utc)
+        dwg.add(dwg.path(
+            d=d,
+            fill=fill_color,
+            stroke=stroke,
+            stroke_width=stroke_width,
+            fill_rule="evenodd",
+            style="vector-effect:non-scaling-stroke",
+        ))
+
+    if isinstance(geom, Polygon):
+        add_poly(geom)
+    elif isinstance(geom, MultiPolygon):
+        for poly in geom.geoms:
+            add_poly(poly)
+    else:
+        mapped = mapping(geom)
+        if mapped.get("type") == "Polygon":
+            add_poly(geom)
+        elif mapped.get("type") == "MultiPolygon":
+            for poly in geom.geoms:
+                add_poly(poly)
+
+    # guardar SVG
+    dwg.save()
+
+    # rasterizar a PNG 200x200 (transparente por defecto)
+    cairosvg.svg2png(bytestring=dwg.tostring(),
+                     write_to=str(out_png),
+                     output_width=tile_size,
+                     output_height=tile_size)
+
+
+# ---------- main ----------
+
+def find_es_geojsons(data_dir: Path, min_year=2016):
+    files = []
+    for p in sorted(data_dir.glob("ES_*_fuegos.geojson")):
+        try:
+            # Nombre esperado: ES_YYYY_fuegos.geojson
+            year = int(p.name.split("_")[1])
+            if year >= min_year:
+                files.append((year, p))
+        except Exception:
+            continue
+    files.sort(key=lambda x: x[0])
+    return files
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Small multiples (2016+) con escala real, filtrado por área y coloreado por reglas de fecha/año. Exporta JSON y tiles PNG."
+    )
+    ap.add_argument("--data", default="data", help="Directorio con ES_YYYY_fuegos.geojson")
+    ap.add_argument("--out", required=True, help="SVG de salida (grande)")
+    ap.add_argument("--min-ha", type=float, default=500.0, help="Mínimo de hectáreas para incluir (>=)")
+    ap.add_argument("--cols", type=int, default=14, help="Número de columnas")
+    ap.add_argument("--cell", type=int, default=64, help="Tamaño de celda en px")
+    ap.add_argument("--margin", type=int, default=24, help="Margen exterior en px")
+    ap.add_argument("--stroke", type=float, default=0.0, help="Grosor del trazo px")
+    ap.add_argument("--label", action="store_true", help="Pinta rank, mun, prov, ccaa, fireyear (tamaño pequeño)")
+    ap.add_argument("--top-n", type=int, default=50, help="Número de features a exportar (JSON + PNGs) con mayor área")
+    args = ap.parse_args()
+
+    data_dir = Path(args.data)
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    files = find_es_geojsons(data_dir, min_year=2016)
+    if not files:
+        raise SystemExit(f"No se encontraron ES_YYYY_fuegos.geojson >= 2016 en {data_dir}")
+
+    # Leer y concatenar
+    gdfs = []
+    for year, pathfile in files:
+        gdf = gpd.read_file(pathfile)
+        if gdf.empty:
+            continue
+        gdf["__source_year"] = year  # por si hace falta
+        gdfs.append(gdf)
+
+    if not gdfs:
+        raise SystemExit("No hay datos válidos en los ficheros encontrados.")
+
+    gdf_all = gpd.pd.concat(gdfs, ignore_index=True)
+    gdf_all = gdf_all.set_geometry(gdf_all.geometry.apply(make_valid))
+    gdf_all = ensure_crs_4326(gdf_all)
+
+    # área final
+    gdf_all["area_ha_final"] = compute_area_ha(gdf_all, area_col_hint="area_ha")
+
+    # filtro por área (excluye < min_ha)
+    gdf_big = gdf_all[gdf_all["area_ha_final"] >= float(args.min_ha)].copy()
+    if gdf_big.empty:
+        raise SystemExit(f"No hay incendios con area_ha >= {args.min_ha} ha.")
+
+    # ordenar desc por área
+    gdf_big.sort_values("area_ha_final", ascending=False, inplace=True)
+    gdf_big.reset_index(drop=True, inplace=True)
+
+    # --- SVG gigante con TODOS los seleccionados por área mínima ---
+    gdf_aea_all = gdf_big.to_crs(3035)
+    w, h = draw_geoms_to_svg_scaled(
+        gdf_aea_all,
+        out,
+        cols=args.cols,
+        cell=args.cell,
+        margin=args.margin,
+        stroke_width=args.stroke,
+        label=args.label,
+        font_size=7,
+    )
+
+    # --- TOP-N para JSON + tiles PNG ---
+    gdf_top = gdf_big.head(args.top_n).copy()
+    gdf_top.reset_index(drop=True, inplace=True)
+    gdf_aea_top = gdf_top.to_crs(3035)
+
+    # Escala GLOBAL para los tiles (misma que la lógica del SVG: basada en los bboxes)
+    geoms_top = list(gdf_aea_top.geometry)
+    max_w = max(g.bounds[2] - g.bounds[0] for g in geoms_top if not g.is_empty)
+    max_h = max(g.bounds[3] - g.bounds[1] for g in geoms_top if not g.is_empty)
+    # queremos llenar ~200px con algo de margen (pad interno := 8)
+    tile_size = 200
+    pad = 8
+    inner = tile_size - pad * 2
+    global_scale_top = min(inner / max_w, inner / max_h)
+
+    # cutoff: 2025-08-08 00:00:00Z
+    cutoff_dt_utc = datetime(2025, 8, 8, 0, 0, 0, tzinfo=timezone.utc)
+
+    # Carpetas de salida para perimeters
+    perim_dir = data_dir / "perimeters"
+    perim_dir.mkdir(parents=True, exist_ok=True)
+
+    # JSON de salida
+    json_out = perim_dir / "perimeters_top.json"
+    json_records = []
+
+    # Exportar tiles de incendios (TOP-N)
+    for idx, row in gdf_top.iterrows():
+        geom = gdf_aea_top.geometry.iloc[idx]
+        # id (int o str). Si no existe 'id', probamos 'ID' o 'fid'
+        feat_id = row.get("id")
+        if feat_id is None:
+            feat_id = row.get("ID", row.get("fid", idx + 1))
+        # normalizamos a str sin espacios
+        feat_id_str = str(int(feat_id)) if str(feat_id).isdigit() else str(feat_id)
+
+        # Colores/fechas
+        fd_dt = parse_firedate(row.get("firedate"))
+        firedate_iso = isoformat_z(fd_dt) if fd_dt else ""
+        firedate_hum = firedate_show_es(fd_dt) if fd_dt else ""
+
+        # Formateos y campos
+        record = {
+            "id": feat_id_str,
+            "prov": row.get("prov"),
+            "mun": row.get("mun"),
+            "area_ha": format_es_number(row.get("area_ha_final"), dec=0),
+            "firedate": firedate_iso,
+            "firedate_show": firedate_hum,
+            "fireyear": safe_int(row.get("fireyear")),
+            "ccaa": row.get("ccaa"),
+        }
+        json_records.append(record)
+
+        # Salidas por feature
+        out_svg_tile = perim_dir / f"{feat_id_str}.svg"
+        out_png_tile = perim_dir / f"{feat_id_str}.png"
+        render_feature_tile(
+            row=row,
+            geom=geom,
+            out_svg=out_svg_tile,
+            out_png=out_png_tile,
+            global_scale=global_scale_top,
+            cutoff_dt_utc=cutoff_dt_utc,
+            stroke="",                 # mismo default que el grande
+            stroke_width=args.stroke,  # por si quieres >0
+            tile_size=tile_size,
+            pad=pad,
+            fill_override=None
+        )
+
+    # Guardar JSON (UTF-8, sin escapar acentos)
+    with open(json_out, "w", encoding="utf-8") as f:
+        json.dump(json_records, f, ensure_ascii=False, indent=2)
+
+    # --------- EXTRA: Exportar municipios Madrid y Barcelona a misma escala ---------
+    muni_path = (data_dir / "geo" / "output" / "municipios.geojson")
+    if muni_path.exists():
+        gdf_muni = gpd.read_file(muni_path)
+        if not gdf_muni.empty and "NAMEUNIT" in gdf_muni.columns:
+            gdf_muni = ensure_crs_4326(gdf_muni)
+            gdf_muni["geometry"] = gdf_muni.geometry.apply(make_valid)
+            # Filtrar y disolver por municipio (por si hay multipiezas)
+            targets = ["Madrid", "Barcelona"]
+            gdf_sel = gdf_muni[gdf_muni["NAMEUNIT"].isin(targets)].copy()
+            if not gdf_sel.empty:
+                gdf_diss = gdf_sel.dissolve(by="NAMEUNIT", as_index=False)
+                gdf_diss_aea = gdf_diss.to_crs(3035)
+
+                # Dummy row para color/fechas (no aplica reglas; usaremos fill_override)
+                dummy_row = {}
+
+                # Parámetros de estilo requeridos
+                stroke_gray = "#ccc"
+                fill_white = "#ffffff"
+
+                for _, muni_row in gdf_diss_aea.iterrows():
+                    name = muni_row.get("NAMEUNIT", "")
+                    name_lower = str(name).strip().lower()
+                    if name_lower in ("madrid", "barcelona"):
+                        out_svg_tile = perim_dir / f"{name_lower}.svg"
+                        out_png_tile = perim_dir / f"{name_lower}.png"
+                        render_feature_tile(
+                            row=dummy_row,
+                            geom=muni_row.geometry,
+                            out_svg=out_svg_tile,
+                            out_png=out_png_tile,
+                            global_scale=global_scale_top,      # misma escala global
+                            cutoff_dt_utc=datetime(1970,1,1,tzinfo=timezone.utc),  # irrelevante
+                            stroke=stroke_gray,
+                            stroke_width=1.0,
+                            tile_size=tile_size,
+                            pad=pad,
+                            fill_override=fill_white
+                        )
+    else:
+        print(f"Aviso: no existe {muni_path}; se omite exportación de Madrid/Barcelona.")
+
+    print(f"SVG escrito en: {out}  ({int(w)}×{int(h)} px)")
+    print("Colores: >=2025-08-08 → #a80127 | year==2025 → #fac4c5 | resto → #d8d0d0")
+    print(f"TOP-N: {args.top_n}  | JSON: {json_out}")
+    print(f"Tiles PNG+SVG en: {perim_dir}  (200x200, escala global consistente)")
+    print("Municipios extra: madrid.svg/png y barcelona.svg/png (stroke #ccc, fill #fff)")
+
+if __name__ == "__main__":
+    main()
